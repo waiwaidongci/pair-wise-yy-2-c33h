@@ -1,29 +1,10 @@
 import http from "node:http";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { loadDb, saveDb, createPrizeEvent, getPrizeEvent, activeSettlement, settlementsOf, commitSettlement, correctRaceResult } from "./settlementStore.js";
+import { computeSettlement, diffSettlement } from "./prizeRules.js";
+import { settlementPage } from "./settlementPage.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const dbPath = join(__dirname, "data", "pigeons.json");
 const port = Number(process.env.PORT || 3024);
 
-const seed = {
-  pigeons: [
-    { ringNo: "CHN-2026-001", owner: "北岸棚", fatherRing: "CHN-2022-188", motherRing: "CHN-2023-512", color: "灰", loft: "北岸A棚", vaccines: [{ date: "2026-04-01", name: "新城疫" }], transfers: [{ date: "2026-04-15", from: "育种棚", to: "北岸棚" }], races: [{ date: "2026-06-01", event: "120公里训放", distance: 120, returnTime: "10:42", rank: 18 }] },
-    { ringNo: "CHN-2022-188", owner: "育种棚", fatherRing: "", motherRing: "", color: "雨点", loft: "种鸽棚", vaccines: [], transfers: [], races: [] },
-    { ringNo: "CHN-2023-512", owner: "育种棚", fatherRing: "", motherRing: "", color: "红轮", loft: "种鸽棚", vaccines: [], transfers: [], races: [] }
-  ]
-};
-
-async function loadDb() {
-  if (!existsSync(dbPath)) {
-    await mkdir(dirname(dbPath), { recursive: true });
-    await writeFile(dbPath, JSON.stringify(seed, null, 2));
-  }
-  return JSON.parse(await readFile(dbPath, "utf8"));
-}
-async function saveDb(db) { await writeFile(dbPath, JSON.stringify(db, null, 2)); }
 async function body(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
@@ -52,6 +33,7 @@ const page = `<!doctype html>
     :root { --bg:#eff2f5; --panel:#fff; --ink:#1f2833; --muted:#697786; --line:#d3dce4; --accent:#315f83; --red:#9b3f35; }
     * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--ink); font-family:Arial,"PingFang SC",sans-serif; }
     header { padding:22px 28px; background:#fff; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:16px; align-items:center; }
+    header a { color:var(--accent); font-weight:700; text-decoration:none; margin-right:12px; }
     h1 { margin:0; font-size:26px; } main { display:grid; grid-template-columns:380px 1fr; gap:22px; padding:22px 28px; }
     form,.panel,.card,.stat { background:#fff; border:1px solid var(--line); border-radius:8px; padding:16px; } h2 { margin:0 0 12px; font-size:18px; }
     label { display:block; margin:10px 0 5px; color:var(--muted); font-size:13px; } input,select { width:100%; border:1px solid var(--line); border-radius:6px; padding:9px; font:inherit; }
@@ -63,7 +45,7 @@ const page = `<!doctype html>
   </style>
 </head>
 <body>
-  <header><div><h1>赛鸽血统环号登记站</h1><div class="meta">档案、血统、转让和归巢成绩</div></div><button id="reload">刷新</button></header>
+  <header><div><h1>赛鸽血统环号登记站</h1><div class="meta">档案、血统、转让和归巢成绩</div></div><div><a href="/settlement">奖金结算台</a><button id="reload">刷新</button></div></header>
   <main>
     <form id="form">
       <h2>创建鸽只档案</h2>
@@ -130,6 +112,10 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { "Content-Type":"text/html; charset=utf-8" });
       return res.end(page);
     }
+    if (req.method === "GET" && url.pathname === "/settlement") {
+      res.writeHead(200, { "Content-Type":"text/html; charset=utf-8" });
+      return res.end(settlementPage);
+    }
     if (req.method === "GET" && url.pathname === "/api/pigeons") return sendJson(res, 200, db.pigeons);
     if (req.method === "POST" && url.pathname === "/api/pigeons") {
       const input = await body(req);
@@ -143,6 +129,13 @@ const server = http.createServer(async (req, res) => {
     if (relationMatch && req.method === "GET") {
       const data = relation(db, decodeURIComponent(relationMatch[1]));
       return data ? sendJson(res, 200, data) : sendJson(res, 404, { error: "pigeon_not_found" });
+    }
+    const correctMatch = url.pathname.match(/^\/api\/pigeons\/(.+)\/races\/correct$/);
+    if (correctMatch && req.method === "POST") {
+      const result = correctRaceResult(db, decodeURIComponent(correctMatch[1]), await body(req));
+      if (result.error) return sendJson(res, result.error === "invalid_rank" ? 400 : 404, { error: result.error });
+      await saveDb(db);
+      return sendJson(res, 200, result.pigeon);
     }
     const actionMatch = url.pathname.match(/^\/api\/pigeons\/(.+)\/(transfers|races|vaccines)$/);
     if (actionMatch && req.method === "POST") {
@@ -158,6 +151,45 @@ const server = http.createServer(async (req, res) => {
       if (actionMatch[2] === "vaccines") pigeon.vaccines.push({ date: input.date || new Date().toISOString().slice(0, 10), name: input.name });
       await saveDb(db);
       return sendJson(res, 200, pigeon);
+    }
+    if (req.method === "GET" && url.pathname === "/api/prize-events") {
+      const list = db.prizeEvents.map(item => {
+        const active = activeSettlement(db, item.id);
+        return { ...item, activeSettlement: active ? { id: active.id, version: active.version, lineCount: active.lines.length, total: active.lines.reduce((sum, line) => sum + line.amount, 0) } : null };
+      });
+      return sendJson(res, 200, list);
+    }
+    if (req.method === "POST" && url.pathname === "/api/prize-events") {
+      try {
+        const prizeEvent = createPrizeEvent(db, await body(req));
+        await saveDb(db);
+        return sendJson(res, 201, prizeEvent);
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
+    const settleMatch = url.pathname.match(/^\/api\/prize-events\/(.+)\/settle$/);
+    if (settleMatch && req.method === "POST") {
+      const prizeEvent = getPrizeEvent(db, decodeURIComponent(settleMatch[1]));
+      if (!prizeEvent) return sendJson(res, 404, { error: "prize_event_not_found" });
+      const computed = computeSettlement(db, prizeEvent);
+      const previous = activeSettlement(db, prizeEvent.id);
+      if (previous) {
+        const { changed, recoveries } = diffSettlement(previous.lines, computed.lines);
+        if (!changed) return sendJson(res, 200, { settlement: previous, changed: false });
+        const settlement = commitSettlement(db, prizeEvent, computed, recoveries);
+        await saveDb(db);
+        return sendJson(res, 200, { settlement, changed: true });
+      }
+      const settlement = commitSettlement(db, prizeEvent, computed, []);
+      await saveDb(db);
+      return sendJson(res, 201, { settlement, changed: true });
+    }
+    const settlementsMatch = url.pathname.match(/^\/api\/prize-events\/(.+)\/settlements$/);
+    if (settlementsMatch && req.method === "GET") {
+      const prizeEvent = getPrizeEvent(db, decodeURIComponent(settlementsMatch[1]));
+      if (!prizeEvent) return sendJson(res, 404, { error: "prize_event_not_found" });
+      return sendJson(res, 200, { event: prizeEvent, settlements: settlementsOf(db, prizeEvent.id) });
     }
     sendJson(res, 404, { error: "not_found" });
   } catch (error) {
